@@ -11,36 +11,36 @@ from main import run_agent, ToolSuite
 load_dotenv()
 
 APP_HOST = os.getenv("APP_HOST","0.0.0.0")
-APP_PORT = int(os.getenv("APP_PORT","7860"))  # not used by Streamlit Cloud
+APP_PORT = int(os.getenv("APP_PORT","7860"))  # Not used by Streamlit Cloud, local only
 UPLOAD_DIR = os.getenv("UPLOAD_DIR","uploads")
 OUTPUTS_DIR = os.getenv("OUTPUTS_DIR","outputs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
 
 st.set_page_config(page_title="Data Analysis Agent", layout="wide")
-st.title("🔍 Data Analysis Agent (Streamlit)")
+st.title("🔍 Data Analysis Agent (Streamlit, HF Inference)")
 
 with st.sidebar:
-    st.subheader("Settings")
-    openai_api_key = st.text_input("OPENAI_API_KEY", value=os.getenv("OPENAI_API_KEY",""), type="password")
-    openai_model = st.text_input("OPENAI_MODEL", value=os.getenv("OPENAI_MODEL","gpt-4o-mini"))
-    openai_temp = st.number_input("OPENAI_TEMPERATURE", min_value=0.0, max_value=1.0, value=float(os.getenv("OPENAI_TEMPERATURE","0.2")), step=0.05)
-    st.caption("Keys are kept in memory only; for Streamlit Cloud, set secrets instead.")
+    st.subheader("Model Settings")
+    hf_token = st.text_input("HF_TOKEN", value=os.getenv("HF_TOKEN",""), type="password")
+    hf_model = st.text_input("HF_MODEL", value=os.getenv("HF_MODEL","Qwen/Qwen2.5-7B-Instruct"))
+    hf_temp = st.number_input("HF_TEMPERATURE", min_value=0.0, max_value=1.0, value=float(os.getenv("HF_TEMPERATURE","0.2")), step=0.05)
+    hf_max_new = st.number_input("HF_MAX_NEW_TOKENS", min_value=64, max_value=4096, value=int(float(os.getenv("HF_MAX_NEW_TOKENS","512"))), step=64)
+    st.caption("Tip: On Streamlit Cloud, set these in **Secrets**. Locally, use `.env`.")
 
-st.markdown("Upload a CSV/XLSX or use the bundled sample. Then enter a task and hit **Run Agent**.")
+st.markdown("Upload a CSV/XLSX or use the bundled sample. Enter a task and click **Run Agent**.")
 
 query = st.text_area("Task", "Group revenue by month; find anomalies; plot top-5 categories.")
 file = st.file_uploader("Upload CSV/XLSX (optional)", type=["csv","xlsx","xls"])
 
-run = st.button("Run Agent")
-
-if run:
-    # ensure OPENAI_API_KEY in env for main.py client
-    if openai_api_key:
-        os.environ["OPENAI_API_KEY"] = openai_api_key
-    if openai_model:
-        os.environ["OPENAI_MODEL"] = openai_model
-    os.environ["OPENAI_TEMPERATURE"] = str(openai_temp)
+if st.button("Run Agent"):
+    # Ensure env vars for main.py’s HF client
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+    if hf_model:
+        os.environ["HF_MODEL"] = hf_model
+    os.environ["HF_TEMPERATURE"] = str(hf_temp)
+    os.environ["HF_MAX_NEW_TOKENS"] = str(hf_max_new)
 
     if file is None:
         data_path = "data/sample_sales.csv"
@@ -60,14 +60,13 @@ if run:
     st.subheader("Agent Output")
     st.code(out)
 
-    # show generated plots
     images = sorted([os.path.join(OUTPUTS_DIR, f) for f in os.listdir(OUTPUTS_DIR) if f.endswith(".png")])
     if images:
         st.subheader("Generated Plots")
-        for img in images[-12:]:  # show last few
+        for img in images[-12:]:
             st.image(img, use_column_width=True)
     else:
-        st.info("No plots generated yet. Ask the agent to create one (e.g., 'plot ...').")
+        st.info("No plots yet. Ask the agent to create one (e.g., 'plot ...').")
 
 st.divider()
-st.caption("Tip: Set your OPENAI_API_KEY in Streamlit secrets. For local dev, set it in .env.")
+st.caption("Uses Hugging Face Inference API. For private deployments, store tokens in Streamlit Secrets.")
