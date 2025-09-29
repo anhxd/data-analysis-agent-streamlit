@@ -1,3 +1,5 @@
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import os
@@ -36,8 +38,6 @@ class PlotTool:
         return f"Saved histogram to {path}"
 
     def _save(self, fig, prefix: str) -> str:
-        import matplotlib
-        matplotlib.use("Agg")
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = os.path.join(self.out_dir, f"{prefix}_{ts}.png")
         fig.savefig(path, bbox_inches="tight")
