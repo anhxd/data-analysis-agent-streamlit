@@ -1,79 +1,46 @@
-import os, json, re
+import os, json
 from dataclasses import dataclass
-from typing import Dict, Any, List
+from typing import Dict, Any, Optional, Tuple
 
 from tools.csv_tool import CSVTool
 from tools.sql_tool import SQLTool
 from tools.plot_tool import PlotTool
 from tools.stats_tool import StatsTool
 
-# -------------------- LLM (Hugging Face Inference API) --------------------
-# We turn chat-style messages into a single prompt string and call text-generation.
-# This works well with instruct models (e.g., Qwen2.5-7B-Instruct, Llama-3 Instruct, Mistral-Instruct).
-from huggingface_hub import InferenceClient
+def call_llm(system: str, messages: list[dict], model: str = None, temperature: float = 0.2) -> str:
+    provider = os.getenv("LLM_PROVIDER", "openai")
+    if provider == "local":
+        import requests
+        base = os.getenv("LLM_BASE_URL", "http://localhost:8000")
+        mdl = os.getenv("LLM_MODEL", "llama3.1:8b-instruct")
+        resp = requests.post(f"{base}/chat", json={
+            "model": mdl,
+            "messages": [{"role":"system","content":system}, *messages],
+            "temperature": temperature,
+        }, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("message","")
+    else:
+        from openai import OpenAI
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("Set OPENAI_API_KEY or configure local provider in .env")
+        client = OpenAI(api_key=api_key)
+        model = model or os.getenv("OPENAI_MODEL","gpt-4o-mini")
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role":"system","content":system}, *messages],
+            temperature=float(os.getenv("OPENAI_TEMPERATURE", temperature)),
+        )
+        return resp.choices[0].message.content
 
-def _messages_to_prompt(system: str, messages: List[dict]) -> str:
-    """
-    Convert chat messages to a generic instruction-style prompt that most
-    HF instruct models will follow. Keeps tool JSON detectable.
-    """
-    buf = []
-    if system:
-        buf.append("### System\n" + system.strip())
-    for m in messages:
-        role = m.get("role", "")
-        content = (m.get("content") or "").strip()
-        if role == "user":
-            buf.append("### User\n" + content)
-        elif role == "assistant":
-            buf.append("### Assistant\n" + content)
-        elif role == "system":
-            # Use this to inject tool results back to the model
-            buf.append("### Tool/Context\n" + content)
-        else:
-            buf.append(f"### {role.capitalize()}\n" + content)
-    # Ask model to continue as Assistant
-    buf.append("### Assistant")
-    return "\n\n".join(buf).strip()
-
-def call_llm(system: str, messages: List[dict], model: str = None, temperature: float = 0.2) -> str:
-    model = model or os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-    token = os.getenv("HF_TOKEN")
-    if not token:
-        raise RuntimeError("HF_TOKEN is not set. Add it to your .env or Streamlit Secrets.")
-    client = InferenceClient(model=model, token=token)
-
-    prompt = _messages_to_prompt(system, messages)
-    max_new_tokens = int(float(os.getenv("HF_MAX_NEW_TOKENS", "512")))
-    temperature = float(os.getenv("HF_TEMPERATURE", temperature))
-
-    # Some HF models stream tokens; we’ll request a single concatenated string
-    text = client.text_generation(
-        prompt,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        do_sample=temperature > 0,
-        repetition_penalty=1.05,
-        return_full_text=False,
-    )
-    # The client returns a plain string for text_generation
-    return text
-
-# -------------------- Agent System Prompt --------------------
-SYSTEM = """\
-You are a careful data-analysis agent that plans with a ReAct loop.
-
-When you need a tool, emit EXACTLY one JSON line by itself (no extra text):
+SYSTEM = """You are a careful data-analysis agent that plans with a ReAct loop.
+When you need a tool, emit EXACTLY one JSON line:
 {"tool":"CSV","args":{"cmd":"load","path":"data/sample_sales.csv"}}
-
 Valid tools: CSV, SQL, STATS, PLOT.
-- CSV: cmds = load(path), head(n), info(), describe(), groupby_agg(by=list, agg_map=dict), filter_query(expr)
-- SQL:  cmds = load_from_df(table_name="df"), query(sql, limit=50)
-- STATS:cmds = corr(cols=list), ttest(col, by), z_anomalies(col, threshold)
-- PLOT: cmds = line(x, y, title?), bar(x, y, title?), hist(col, bins?, title?)
-
-After each tool call you will receive TOOL_RESULT with the output. Use it to decide next step.
-Finish with a short, clear summary and list any saved plot paths, if any.
+After you get TOOL_RESULT, continue planning or finish with a short, clear summary.
+List any saved plot paths in the final answer.
 """
 
 @dataclass
@@ -128,25 +95,74 @@ def dispatch_tool(name: str, args: Dict[str,Any], tools: ToolSuite) -> str:
         raise ValueError(f"Unknown PLOT cmd: {cmd}")
     raise ValueError(f"Unknown tool: {name}")
 
+def _extract_tool_call(reply: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Robustly extract a JSON object like {"tool":"CSV","args":{...}} from free-form text.
+
+    Handles nested braces in args by brace balancing and ignores braces inside strings.
+    Returns (tool_name, args_dict) if found, else None.
+    """
+    start_key = '"tool"'
+    start_idx = reply.find(start_key)
+    if start_idx == -1:
+        return None
+    # Find the opening brace of the JSON object containing this key
+    brace_start = reply.rfind('{', 0, start_idx)
+    if brace_start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    end_idx = None
+    for i in range(brace_start, len(reply)):
+        ch = reply[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end_idx = i
+                    break
+    if end_idx is None:
+        return None
+    import json
+    try:
+        obj = json.loads(reply[brace_start:end_idx+1])
+        name = obj.get("tool")
+        args = obj.get("args", {})
+        if isinstance(name, str) and isinstance(args, dict):
+            return name, args
+    except Exception:
+        return None
+    return None
+
 def run_agent(user_query: str, tools: ToolSuite, df_default_path: str = "data/sample_sales.csv", max_steps: int = 10) -> str:
-    messages: List[dict] = [
+    messages: list[dict] = [
         {"role":"user","content": f"""{user_query}
 If you need data, use CSV.load('{df_default_path}')."""}
     ]
     for _ in range(max_steps):
         reply = call_llm(SYSTEM, messages)
-        # Detect a single-line JSON tool call
-        m = re.search(r'\{\s*"tool"\s*:\s*"(CSV|SQL|STATS|PLOT)"\s*,\s*"args"\s*:\s*(\{.*?\})\s*\}\s*$', reply.strip(), re.S)
-        if m:
-            tool, args = m.group(1), json.loads(m.group(2))
+        extracted = _extract_tool_call(reply)
+        if extracted:
+            t, args = extracted
             try:
-                obs = dispatch_tool(tool, args, tools)
+                obs = dispatch_tool(t, args, tools)
             except Exception as e:
                 obs = f"TOOL-ERROR: {e}"
-            messages.append({"role":"assistant","content": reply})
+            messages.append({"role":"assistant","content":reply})
             messages.append({"role":"system","content": f"TOOL_RESULT:\n{obs}"})
             continue
-        messages.append({"role":"assistant","content": reply})
-        if any(k in reply.lower() for k in ["final answer", "here's the summary", "summary:"]):
+        messages.append({"role":"assistant","content":reply})
+        if any(k in reply.lower() for k in ["final answer","here's the summary","summary:"]):
             return reply
     return messages[-1]["content"]
