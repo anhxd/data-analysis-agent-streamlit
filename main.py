@@ -1,14 +1,12 @@
-# main.py — Streamlit/HF-friendly agent runtime with robust debugging & fallbacks
-# - Better error messages (no more bare "ERROR:")
-# - Hugging Face provider controls: HF_PROVIDER=hf-inference (recommended) or custom HF_BASE_URL (TGI/OpenAI-style)
-# - Automatic fallback from text_generation → chat_completion when provider/model only supports "conversational"
-# - Retries with backoff on transient errors/timeouts
-# - DEBUG transcript logging, and optional RETURN_TRANSCRIPT to append a short trace into the final answer
+# main.py — HF chat-first agent runtime with robust debugging & fallbacks
+# - Uses Hugging Face Inference (chat-completion first; text-generation fallback)
+# - Optional TGI/OpenAI-style server via HF_BASE_URL (/v1/chat/completions)
+# - Retries with backoff, clear error surfacing
+# - DEBUG transcript logging (set DEBUG=1) and optional RETURN_TRANSCRIPT
 # - Safer JSON tool-call extraction with brace balancing
 
 import os
 import json
-import re
 import time
 import traceback
 from dataclasses import dataclass
@@ -19,9 +17,10 @@ from tools.sql_tool import SQLTool
 from tools.plot_tool import PlotTool
 from tools.stats_tool import StatsTool
 
-# ----------------------------
+
+# =========================
 # Debug/Config toggles
-# ----------------------------
+# =========================
 DEBUG = os.getenv("DEBUG", "0") == "1"
 RETURN_TRANSCRIPT = os.getenv("RETURN_TRANSCRIPT", "0") == "1"
 MAX_STEPS = int(os.getenv("MAX_STEPS", "12"))
@@ -29,108 +28,44 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
 RETRIES = int(os.getenv("RETRIES", "2"))
 RETRY_BACKOFF = float(os.getenv("RETRY_BACKOFF", "1.5"))
 
-# ----------------------------
-# Utility: structured debug prints
-# ----------------------------
+
 def dprint(*args):
     if DEBUG:
         print("[DEBUG]", *args, flush=True)
 
-def _short(s: str, n: int = 400):
-    s = s.strip()
+
+def _short(s: str, n: int = 500):
+    s = (s or "").strip()
     return s if len(s) <= n else s[:n] + "... [truncated]"
 
-# ----------------------------
-# Prompt flattening (for text-generation style models)
-# ----------------------------
+
+# =========================
+# Prompt flattening (only for text-generation fallback)
+# =========================
 def _messages_to_prompt(system: str, messages: List[dict]) -> str:
-    buf = []
+    parts = []
     if system:
-        buf.append("### System\n" + system.strip())
+        parts.append("### System\n" + system.strip())
     for m in messages:
         role = m.get("role", "")
         content = (m.get("content") or "").strip()
         if role == "user":
-            buf.append("### User\n" + content)
+            parts.append("### User\n" + content)
         elif role == "assistant":
-            buf.append("### Assistant\n" + content)
+            parts.append("### Assistant\n" + content)
         elif role == "system":
-            buf.append("### Tool/Context\n" + content)
+            parts.append("### Tool/Context\n" + content)
         else:
-            buf.append(f"### {role.capitalize()}\n" + content)
-    buf.append("### Assistant")
-    return "\n\n".join(buf).strip()
+            parts.append(f"### {role.capitalize()}\n{content}")
+    parts.append("### Assistant")
+    return "\n\n".join(parts).strip()
 
-# ----------------------------
-# LLM call with retries + HF fallbacks
-# ----------------------------
-def _call_hf_inference(messages: List[dict], system: str, model: str, token: str, provider: str) -> str:
-    """
-    Try text_generation first (works for most instruct models with hf-inference).
-    If provider/model complains about 'conversational only', fall back to chat_completion.
-    """
-    from huggingface_hub import InferenceClient
 
-    client = InferenceClient(model=model, token=token, provider=provider if provider else None)
-    prompt = _messages_to_prompt(system, messages)
-    max_new_tokens = int(float(os.getenv("HF_MAX_NEW_TOKENS", "512")))
-    temperature = float(os.getenv("HF_TEMPERATURE", "0.2"))
-    do_sample = temperature > 0
-
-    # Try text_generation
-    try:
-        dprint("HF text_generation →", {"model": model, "provider": provider, "max_new_tokens": max_new_tokens, "temp": temperature})
-        text = client.text_generation(
-            prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=do_sample,
-            repetition_penalty=1.05,
-            return_full_text=False,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if isinstance(text, str) and text.strip():
-            return text
-        raise RuntimeError(f"Empty response from text_generation (model={model})")
-    except Exception as e:
-        emsg = f"{type(e).__name__}: {str(e)}"
-        dprint("text_generation failed:", emsg)
-        # If provider/model only supports conversational/chat, try chat_completion
-        if "conversational" in emsg.lower() or "Supported task: conversational" in emsg or "chat" in emsg.lower():
-            try:
-                dprint("HF chat_completion fallback →", {"model": model, "provider": provider})
-                # Convert messages to the HF chat format
-                # HF expects: [{"role": "user"/"assistant"/"system", "content": "..."}, ...]
-                chat_resp = client.chat_completion(
-                    messages=[{"role": "system", "content": system}, *messages],
-                    max_tokens=max_new_tokens,
-                    temperature=temperature,
-                    timeout=REQUEST_TIMEOUT,
-                )
-                # huggingface_hub returns a dict-like object with choices -> message -> content (OpenAI-like)
-                if hasattr(chat_resp, "choices") and chat_resp.choices:
-                    c0 = chat_resp.choices[0]
-                    # Support both dict and object attrs
-                    msg = c0.get("message") if isinstance(c0, dict) else getattr(c0, "message", None)
-                    if isinstance(msg, dict):
-                        content = msg.get("content")
-                    else:
-                        content = getattr(msg, "content", None)
-                    if content:
-                        return content
-                # Some providers may return plain text under .generated_text
-                content = getattr(chat_resp, "generated_text", None) or (chat_resp.get("generated_text") if isinstance(chat_resp, dict) else None)
-                if content:
-                    return content
-                raise RuntimeError("Empty response from chat_completion fallback")
-            except Exception as e2:
-                raise RuntimeError(f"chat_completion fallback failed: {type(e2).__name__}: {str(e2)}") from e2
-        raise
-
+# =========================
+# LLM callers (HF chat-first)
+# =========================
 def _call_hf_tgi(messages: List[dict], system: str, model: str, token: Optional[str], base_url: str) -> str:
-    """
-    Call a TGI/OpenAI-compatible /v1/chat/completions endpoint.
-    """
+    """Call a TGI/OpenAI-compatible /v1/chat/completions endpoint."""
     import requests
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     body = {
@@ -140,20 +75,66 @@ def _call_hf_tgi(messages: List[dict], system: str, model: str, token: Optional[
         "max_tokens": int(float(os.getenv("HF_MAX_NEW_TOKENS", "512"))),
     }
     url = base_url.rstrip("/") + "/v1/chat/completions"
-    dprint("POST", url, "body_preview=", _short(json.dumps(body)[:600]))
+    dprint("POST", url, "body_preview=", _short(json.dumps(body)))
     r = requests.post(url, json=body, headers=headers, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     data = r.json()
-    # Try OpenAI-like shape first
     if isinstance(data, dict) and data.get("choices"):
-        content = data["choices"][0]["message"]["content"]
-        if content:
-            return content
-    # Fallback shapes
+        return data["choices"][0]["message"]["content"]
     for key in ("generated_text", "message", "text"):
         if key in data and data[key]:
             return data[key]
     raise RuntimeError(f"TGI response missing expected fields: keys={list(data)[:8]}")
+
+
+def _call_hf_inference(messages: List[dict], system: str, model: str, token: str, provider: str) -> str:
+    """Use huggingface_hub.InferenceClient: chat_completion first, text_generation fallback."""
+    from huggingface_hub import InferenceClient
+
+    client = InferenceClient(model=model, token=token, provider=provider if provider else None)
+    max_new_tokens = int(float(os.getenv("HF_MAX_NEW_TOKENS", "512")))
+    temperature = float(os.getenv("HF_TEMPERATURE", "0.2"))
+    timeout = REQUEST_TIMEOUT
+
+    # Try chat first (works for conversational-only endpoints)
+    try:
+        dprint("HF chat_completion →", {"model": model, "provider": provider})
+        resp = client.chat_completion(
+            messages=[{"role": "system", "content": system}, *messages],
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            timeout=timeout,
+        )
+        # OpenAI-like shape
+        if hasattr(resp, "choices") and resp.choices:
+            c0 = resp.choices[0]
+            msg = c0.get("message") if isinstance(c0, dict) else getattr(c0, "message", None)
+            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            if content:
+                return content
+        # Some providers put plain text under this key
+        if isinstance(resp, dict) and resp.get("generated_text"):
+            return resp["generated_text"]
+        raise RuntimeError("Empty chat response")
+    except Exception as e_chat:
+        dprint("chat_completion failed:", f"{type(e_chat).__name__}: {str(e_chat)}")
+        # Fallback to text_generation for models that only expose that task
+        prompt = _messages_to_prompt(system, messages)
+        from huggingface_hub import InferenceClient as _Client
+        client = _Client(model=model, token=token, provider=provider if provider else None)
+        text = client.text_generation(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=temperature > 0,
+            repetition_penalty=1.05,
+            return_full_text=False,
+            timeout=timeout,
+        )
+        if not isinstance(text, str) or not text.strip():
+            raise RuntimeError(f"HF text_generation returned empty result ({type(e_chat).__name__}: {e_chat})")
+        return text
+
 
 def call_llm(system: str, messages: List[dict], model: Optional[str] = None, temperature: float = 0.2) -> str:
     """
@@ -177,7 +158,7 @@ def call_llm(system: str, messages: List[dict], model: Optional[str] = None, tem
                     "temperature": float(os.getenv("LOCAL_TEMPERATURE", temperature)),
                 }
                 url = base.rstrip("/") + "/chat"
-                dprint(f"[{attempt}/{RETRIES+1}] local LLM POST", url, "body_preview=", _short(json.dumps(body)[:600]))
+                dprint(f"[{attempt}/{RETRIES+1}] local LLM POST", url, "body_preview=", _short(json.dumps(body)))
                 resp = requests.post(url, json=body, timeout=REQUEST_TIMEOUT)
                 resp.raise_for_status()
                 data = resp.json()
@@ -189,16 +170,16 @@ def call_llm(system: str, messages: List[dict], model: Optional[str] = None, tem
             elif provider == "hf":
                 mdl = model or os.getenv("HF_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
                 token = os.getenv("HF_TOKEN")
-                base = os.getenv("HF_BASE_URL")  # if set → use TGI/OpenAI-style
-                prov = os.getenv("HF_PROVIDER", "hf-inference")  # recommended default
+                base = os.getenv("HF_BASE_URL")  # If set → use TGI/OpenAI-style
+                prov = os.getenv("HF_PROVIDER", "hf-inference")  # pin to avoid third-party quirks
 
                 if base:
                     dprint(f"[{attempt}/{RETRIES+1}] HF TGI route → base={base}, model={mdl}")
                     return _call_hf_tgi(messages, system, mdl, token, base_url=base)
                 else:
-                    dprint(f"[{attempt}/{RETRIES+1}] HF Inference route → provider={prov}, model={mdl}")
                     if not token:
                         raise RuntimeError("HF_TOKEN not set for hf inference provider")
+                    dprint(f"[{attempt}/{RETRIES+1}] HF Inference route → provider={prov}, model={mdl}")
                     return _call_hf_inference(messages, system, mdl, token, provider=prov)
 
             else:
@@ -212,15 +193,15 @@ def call_llm(system: str, messages: List[dict], model: Optional[str] = None, tem
                 dprint(f"Retrying in ~{sleep_s:.1f}s ...")
                 time.sleep(sleep_s)
             else:
-                # Surface rich error
                 raise RuntimeError(
                     f"LLM call failed after {RETRIES+1} attempts. "
                     f"Last error: {type(e).__name__}: {str(e)}\n{traceback.format_exc(limit=2)}"
                 ) from e
 
-# ----------------------------
+
+# =========================
 # System prompt
-# ----------------------------
+# =========================
 SYSTEM = """You are a careful data-analysis agent that plans with a ReAct loop.
 When you need a tool, emit EXACTLY one JSON line:
 {"tool":"CSV","args":{"cmd":"load","path":"data/sample_sales.csv"}}
@@ -229,15 +210,17 @@ After you get TOOL_RESULT, continue planning or finish with a short, clear summa
 List any saved plot paths in the final answer.
 """
 
-# ----------------------------
+
+# =========================
 # Tools plumbing
-# ----------------------------
+# =========================
 @dataclass
 class ToolSuite:
     csv: CSVTool
     sql: SQLTool
     plot: PlotTool
     stats: StatsTool
+
 
 def dispatch_tool(name: str, args: Dict[str, Any], tools: ToolSuite) -> str:
     if name == "CSV":
@@ -284,9 +267,10 @@ def dispatch_tool(name: str, args: Dict[str, Any], tools: ToolSuite) -> str:
         raise ValueError(f"Unknown PLOT cmd: {cmd}")
     raise ValueError(f"Unknown tool: {name}")
 
-# ----------------------------
+
+# =========================
 # Robust tool-call extraction
-# ----------------------------
+# =========================
 def _extract_tool_call(reply: str) -> Optional[Tuple[str, Dict[str, Any]]]:
     """
     Extract {"tool":"CSV","args":{...}} from free-form text using brace balancing.
@@ -301,6 +285,7 @@ def _extract_tool_call(reply: str) -> Optional[Tuple[str, Dict[str, Any]]]:
     brace_start = reply.rfind("{", 0, start_idx)
     if brace_start == -1:
         return None
+
     depth = 0
     in_string = False
     escape = False
@@ -326,6 +311,7 @@ def _extract_tool_call(reply: str) -> Optional[Tuple[str, Dict[str, Any]]]:
                     break
     if end_idx is None:
         return None
+
     try:
         obj = json.loads(reply[brace_start : end_idx + 1])
         name = obj.get("tool")
@@ -336,9 +322,10 @@ def _extract_tool_call(reply: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         dprint("JSON parse failed in _extract_tool_call:", f"{type(e).__name__}: {str(e)}")
     return None
 
-# ----------------------------
+
+# =========================
 # Agent loop
-# ----------------------------
+# =========================
 def run_agent(user_query: str, tools: ToolSuite, df_default_path: str = "data/sample_sales.csv", max_steps: int = MAX_STEPS) -> str:
     messages: List[dict] = [
         {
@@ -359,7 +346,7 @@ If you need data, use CSV.load('{df_default_path}').""",
             raise
 
         dprint(f"STEP {step} ← LLM reply preview:", _short(reply))
-        transcript_chunks.append(f"[Assistant {step}] { _short(reply, 800) }")
+        transcript_chunks.append(f"[Assistant {step}] { _short(reply, 900) }")
 
         extracted = _extract_tool_call(reply)
         if extracted:
@@ -373,19 +360,19 @@ If you need data, use CSV.load('{df_default_path}').""",
                 dprint(f"STEP {step} TOOL ERROR:", obs)
             messages.append({"role": "assistant", "content": reply})
             messages.append({"role": "system", "content": f"TOOL_RESULT:\n{obs}"})
-            transcript_chunks.append(f"[Tool {t}] { _short(obs, 800) }")
+            transcript_chunks.append(f"[Tool {t}] { _short(obs, 900) }")
             continue
 
         messages.append({"role": "assistant", "content": reply})
 
-        # Heuristics to detect finish
+        # Finish heuristics
         if any(k in reply.lower() for k in ["final answer", "here's the summary", "summary:"]):
             final = reply
             if RETURN_TRANSCRIPT:
                 final += "\n\n---\n[debug transcript]\n" + "\n".join(transcript_chunks[-8:])
             return final
 
-    # Fallback: return last assistant reply if we hit step limit
+    # Step limit reached
     final = messages[-1]["content"] if messages else ""
     if RETURN_TRANSCRIPT:
         final += "\n\n---\n[debug transcript]\n" + "\n".join(transcript_chunks[-8:])
