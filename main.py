@@ -8,7 +8,7 @@ from tools.plot_tool import PlotTool
 from tools.stats_tool import StatsTool
 
 def call_llm(system: str, messages: list[dict], model: str = None, temperature: float = 0.2) -> str:
-    provider = os.getenv("LLM_PROVIDER", "openai")
+    provider = os.getenv("LLM_PROVIDER", "hf")
     if provider == "local":
         import requests
         base = os.getenv("LLM_BASE_URL", "http://localhost:8000")
@@ -21,19 +21,49 @@ def call_llm(system: str, messages: list[dict], model: str = None, temperature: 
         resp.raise_for_status()
         data = resp.json()
         return data.get("message","")
+    elif provider == "hf":
+        # Hugging Face Text Generation Inference or Inference API
+        # Preferred: text-generation-inference endpoint via base URL (TGI-compatible)
+        base = os.getenv("HF_BASE_URL")
+        token = os.getenv("HF_TOKEN")
+        mdl = model or os.getenv("HF_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
+        # If HF_BASE_URL is provided, use a TGI-compatible /v1/chat/completions route
+        if base:
+            import requests
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            # Build OpenAI-style chat body for TGI compatibility
+            body = {
+                "model": mdl,
+                "messages": [{"role":"system","content":system}, *messages],
+                "temperature": float(os.getenv("HF_TEMPERATURE", temperature)),
+            }
+            url = base.rstrip('/') + "/v1/chat/completions"
+            r = requests.post(url, json=body, headers=headers, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            # Try OpenAI-like shape first
+            if isinstance(data, dict) and data.get("choices"):
+                return data["choices"][0]["message"]["content"]
+            # Fallback to generic text field if provider differs
+            return data.get("generated_text") or data.get("message") or ""
+        else:
+            # Fallback: use huggingface_hub InferenceClient for chat-like generation
+            from huggingface_hub import InferenceClient
+            if not token:
+                raise RuntimeError("Set HF_TOKEN for Hugging Face provider or configure HF_BASE_URL.")
+            client = InferenceClient(model=mdl, token=token)
+            # Simple prompt flatten: concatenate messages with role tags
+            def flatten(ms):
+                parts = [f"System: {system}"]
+                for m in ms:
+                    parts.append(f"{m['role'].capitalize()}: {m['content']}")
+                parts.append("Assistant:")
+                return "\n\n".join(parts)
+            prompt = flatten(messages)
+            out = client.text_generation(prompt, temperature=float(os.getenv("HF_TEMPERATURE", temperature)), max_new_tokens=int(os.getenv("HF_MAX_NEW_TOKENS", "512")))
+            return out
     else:
-        from openai import OpenAI
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("Set OPENAI_API_KEY or configure local provider in .env")
-        client = OpenAI(api_key=api_key)
-        model = model or os.getenv("OPENAI_MODEL","gpt-4o-mini")
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role":"system","content":system}, *messages],
-            temperature=float(os.getenv("OPENAI_TEMPERATURE", temperature)),
-        )
-        return resp.choices[0].message.content
+        raise RuntimeError("Unsupported LLM_PROVIDER. Set LLM_PROVIDER=hf or LLM_PROVIDER=local.")
 
 SYSTEM = """You are a careful data-analysis agent that plans with a ReAct loop.
 When you need a tool, emit EXACTLY one JSON line:
