@@ -4,6 +4,11 @@
 # - Retries with backoff, clear error surfacing
 # - DEBUG transcript logging (set DEBUG=1) and optional RETURN_TRANSCRIPT
 # - Safer JSON tool-call extraction with brace balancing
+#
+# Notes (docs):
+# • HF InferenceClient supports a client-level `timeout` parameter (set on constructor, not per-call). :contentReference[oaicite:0]{index=0}
+# • Chat Completion is a first-class task across HF providers; prefer it for conversational models. :contentReference[oaicite:1]{index=1}
+# • TGI exposes an OpenAI-compatible /v1/chat/completions endpoint (Messages API). :contentReference[oaicite:2]{index=2}
 
 import os
 import json
@@ -40,7 +45,7 @@ def _short(s: str, n: int = 500):
 
 
 # =========================
-# Prompt flattening (only for text-generation fallback)
+# Prompt flattening (for text-generation fallback)
 # =========================
 def _messages_to_prompt(system: str, messages: List[dict]) -> str:
     parts = []
@@ -64,8 +69,10 @@ def _messages_to_prompt(system: str, messages: List[dict]) -> str:
 # =========================
 # LLM callers (HF chat-first)
 # =========================
-def _call_hf_tgi(messages: List[dict], system: str, model: str, token: Optional[str], base_url: str) -> str:
-    """Call a TGI/OpenAI-compatible /v1/chat/completions endpoint."""
+def _call_hf_tgi(messages: List[dict], system: str, model: str, token: Optional[str], base_url: str, request_timeout: int) -> str:
+    """
+    Call a TGI/OpenAI-compatible /v1/chat/completions endpoint.
+    """
     import requests
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     body = {
@@ -76,7 +83,7 @@ def _call_hf_tgi(messages: List[dict], system: str, model: str, token: Optional[
     }
     url = base_url.rstrip("/") + "/v1/chat/completions"
     dprint("POST", url, "body_preview=", _short(json.dumps(body)))
-    r = requests.post(url, json=body, headers=headers, timeout=REQUEST_TIMEOUT)
+    r = requests.post(url, json=body, headers=headers, timeout=request_timeout)
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict) and data.get("choices"):
@@ -87,23 +94,32 @@ def _call_hf_tgi(messages: List[dict], system: str, model: str, token: Optional[
     raise RuntimeError(f"TGI response missing expected fields: keys={list(data)[:8]}")
 
 
-def _call_hf_inference(messages: List[dict], system: str, model: str, token: str, provider: str) -> str:
-    """Use huggingface_hub.InferenceClient: chat_completion first, text_generation fallback."""
+def _call_hf_inference(messages: List[dict], system: str, model: str, token: str, provider: str, request_timeout: int) -> str:
+    """
+    Use huggingface_hub.InferenceClient:
+      - set timeout on the client (constructor; many hub versions do NOT accept per-call `timeout`)
+      - chat_completion first; fallback to text_generation
+    """
     from huggingface_hub import InferenceClient
 
-    client = InferenceClient(model=model, token=token, provider=provider if provider else None)
+    client = InferenceClient(
+        model=model,
+        token=token,
+        provider=provider if provider else None,
+        timeout=request_timeout,  # client-level timeout (recommended) :contentReference[oaicite:3]{index=3}
+    )
+
     max_new_tokens = int(float(os.getenv("HF_MAX_NEW_TOKENS", "512")))
     temperature = float(os.getenv("HF_TEMPERATURE", "0.2"))
-    timeout = REQUEST_TIMEOUT
 
-    # Try chat first (works for conversational-only endpoints)
+    # Try chat first (portable across conversational-only providers) :contentReference[oaicite:4]{index=4}
     try:
         dprint("HF chat_completion →", {"model": model, "provider": provider})
         resp = client.chat_completion(
             messages=[{"role": "system", "content": system}, *messages],
             max_tokens=max_new_tokens,
             temperature=temperature,
-            timeout=timeout,
+            # no per-call timeout kwarg here
         )
         # OpenAI-like shape
         if hasattr(resp, "choices") and resp.choices:
@@ -112,16 +128,14 @@ def _call_hf_inference(messages: List[dict], system: str, model: str, token: str
             content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
             if content:
                 return content
-        # Some providers put plain text under this key
+        # Some providers return plain text
         if isinstance(resp, dict) and resp.get("generated_text"):
             return resp["generated_text"]
         raise RuntimeError("Empty chat response")
     except Exception as e_chat:
         dprint("chat_completion failed:", f"{type(e_chat).__name__}: {str(e_chat)}")
-        # Fallback to text_generation for models that only expose that task
+        # Fallback to text_generation (some endpoints expose only this task)
         prompt = _messages_to_prompt(system, messages)
-        from huggingface_hub import InferenceClient as _Client
-        client = _Client(model=model, token=token, provider=provider if provider else None)
         text = client.text_generation(
             prompt,
             max_new_tokens=max_new_tokens,
@@ -129,7 +143,7 @@ def _call_hf_inference(messages: List[dict], system: str, model: str, token: str
             do_sample=temperature > 0,
             repetition_penalty=1.05,
             return_full_text=False,
-            timeout=timeout,
+            # no per-call timeout kwarg here
         )
         if not isinstance(text, str) or not text.strip():
             raise RuntimeError(f"HF text_generation returned empty result ({type(e_chat).__name__}: {e_chat})")
@@ -171,16 +185,16 @@ def call_llm(system: str, messages: List[dict], model: Optional[str] = None, tem
                 mdl = model or os.getenv("HF_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
                 token = os.getenv("HF_TOKEN")
                 base = os.getenv("HF_BASE_URL")  # If set → use TGI/OpenAI-style
-                prov = os.getenv("HF_PROVIDER", "hf-inference")  # pin to avoid third-party quirks
+                prov = os.getenv("HF_PROVIDER", "hf-inference")  # pin to avoid third-party quirks :contentReference[oaicite:5]{index=5}
 
                 if base:
                     dprint(f"[{attempt}/{RETRIES+1}] HF TGI route → base={base}, model={mdl}")
-                    return _call_hf_tgi(messages, system, mdl, token, base_url=base)
+                    return _call_hf_tgi(messages, system, mdl, token, base_url=base, request_timeout=REQUEST_TIMEOUT)
                 else:
                     if not token:
                         raise RuntimeError("HF_TOKEN not set for hf inference provider")
                     dprint(f"[{attempt}/{RETRIES+1}] HF Inference route → provider={prov}, model={mdl}")
-                    return _call_hf_inference(messages, system, mdl, token, provider=prov)
+                    return _call_hf_inference(messages, system, mdl, token, provider=prov, request_timeout=REQUEST_TIMEOUT)
 
             else:
                 raise RuntimeError("Unsupported LLM_PROVIDER. Use LLM_PROVIDER=hf or local.")
