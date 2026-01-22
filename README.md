@@ -1,5 +1,5 @@
 # Data Analysis Agent — Streamlit 
-This is a Gradio-only project (no Docker) for an LLM-driven **Data Analysis Agent**.
+This is a Gradio-only project for an LLM-driven **Data Analysis Agent**.
 
 - Upload CSV/XLSX (or use `data/sample_sales.csv`)
 - The agent plans tool use (CSV/SQL/STATS/PLOT), runs analysis, and outputs a concise summary
